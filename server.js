@@ -1,19 +1,18 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
-
 const app = express();
-app.use(cors({ origin: '*' }));
+
+app.use(cors());
 app.use(express.json());
 
-// ── Cache ─────────────────────────────────────────────────────────
+// Cache
 let collectionsCache = null;
-let priceHistoryCache = {};
+let priceHistoryCache = {}; // slug -> [{time, price}]
 let lastFetch = 0;
-let tonUsd = 2.05;
-const CACHE_TTL = 20000;
+const CACHE_TTL = 20000; // 20 секунд
 
-// ── Portal Market ─────────────────────────────────────────────────
+// ── Portal Market — основной источник ────────────────────────────
 async function fetchPortal() {
   try {
     const r = await fetch('https://portal-market.com/api/collections?limit=300', {
@@ -22,9 +21,8 @@ async function fetchPortal() {
         'Accept': 'application/json',
         'Referer': 'https://portal-market.com/'
       },
-      timeout: 12000
+      timeout: 10000
     });
-    if (!r.ok) throw new Error('Portal HTTP ' + r.status);
     const j = await r.json();
     const cols = j.collections || [];
     const changes = j.floor_changes || {};
@@ -53,6 +51,8 @@ async function fetchPortal() {
   }
 }
 
+// ── TON/USD rate ──────────────────────────────────────────────────
+let tonUsd = 5.5;
 async function fetchTonRate() {
   try {
     const r = await fetch('https://tonapi.io/v2/rates?tokens=ton&currencies=usd', { timeout: 5000 });
@@ -62,12 +62,13 @@ async function fetchTonRate() {
   } catch(e) {}
 }
 
-async function fetchPortalHistory(slug) {
+// ── Price history from Portal sales ──────────────────────────────
+async function fetchPortalHistory(slug, limit = 100) {
   try {
-    const r = await fetch(
-      `https://portal-market.com/api/market-activity?gift_name=${encodeURIComponent(slug)}&type=sale&limit=200&sort=latest`,
-      { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }, timeout: 8000 }
-    );
+    const r = await fetch(`https://portal-market.com/api/market-activity?gift_name=${encodeURIComponent(slug)}&type=sale&limit=${limit}&sort=latest`, {
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
+      timeout: 8000
+    });
     if (!r.ok) return [];
     const j = await r.json();
     const items = j.activities || j.sales || j.data || [];
@@ -79,89 +80,104 @@ async function fetchPortalHistory(slug) {
         source: 'portal_sale'
       }))
       .sort((a, b) => a.time - b.time);
-  } catch(e) { return []; }
+  } catch(e) {
+    return [];
+  }
 }
 
+// ── Update loop ───────────────────────────────────────────────────
 async function updateAll() {
   const now = Date.now();
   if (now - lastFetch < CACHE_TTL) return;
   lastFetch = now;
 
-  console.log('[Proxy] Updating from Portal Market...');
+  console.log('[Proxy] Updating prices...');
   const [portalData] = await Promise.allSettled([fetchPortal(), fetchTonRate()]);
 
   if (portalData?.value) {
     collectionsCache = portalData.value;
+
+    // Сохраняем точки в историю
     collectionsCache.forEach(c => {
       if (!priceHistoryCache[c.slug]) priceHistoryCache[c.slug] = [];
       priceHistoryCache[c.slug].push({ time: now, price: c.floor });
+      // Держим 7 дней данных при 20с интервале = 30240 точек
       if (priceHistoryCache[c.slug].length > 30240) {
         priceHistoryCache[c.slug] = priceHistoryCache[c.slug].slice(-10000);
       }
     });
-    console.log(`[Proxy] ✅ ${collectionsCache.length} collections, TON=$${tonUsd}`);
+
+    console.log(`[Proxy] Updated ${collectionsCache.length} collections, TON=$${tonUsd}`);
   }
 }
 
-// Запуск
+// Запускаем сразу и потом каждые 20 секунд
 updateAll();
 setInterval(updateAll, 20000);
 setInterval(fetchTonRate, 60000);
 
-// ── API Routes ─────────────────────────────────────────────────────
+// ── API Routes ────────────────────────────────────────────────────
 
-app.get('/', (req, res) => res.json({
-  name: 'GiftMarket Proxy',
-  status: 'ok',
-  collections: collectionsCache?.length || 0,
-  ton_usd: tonUsd,
-  endpoints: ['/api/prices', '/api/history/:slug', '/api/ton', '/api/health']
-}));
-
+// GET /api/prices — все цены сразу
 app.get('/api/prices', async (req, res) => {
   await updateAll();
   if (!collectionsCache) return res.json({ error: 'loading', collections: [], ton_usd: tonUsd });
-  res.json({ collections: collectionsCache, ton_usd: tonUsd, updated_at: lastFetch, count: collectionsCache.length });
+
+  res.json({
+    collections: collectionsCache,
+    ton_usd: tonUsd,
+    updated_at: lastFetch,
+    count: collectionsCache.length
+  });
 });
 
+// GET /api/history/:slug — история цен конкретного подарка
 app.get('/api/history/:slug', async (req, res) => {
   const { slug } = req.params;
-  const { hours = 99999 } = req.query;
+  const { hours = 72 } = req.query;
+
   let history = priceHistoryCache[slug] || [];
 
+  // Если история пустая — пробуем загрузить с Portal
   if (history.length < 5) {
-    const fresh = await fetchPortalHistory(slug);
+    const fresh = await fetchPortalHistory(slug, 200);
     if (fresh.length > 0) {
       priceHistoryCache[slug] = [...fresh, ...history].sort((a,b) => a.time - b.time);
       history = priceHistoryCache[slug];
     }
   }
 
-  const cutoff = hours >= 99999 ? 0 : Date.now() - parseFloat(hours) * 3600000;
+  // Фильтруем по периоду
+  const cutoff = hours == 99999 ? 0 : Date.now() - parseFloat(hours) * 3600000;
   const filtered = history.filter(p => p.time >= cutoff);
-  res.json({ slug, history: filtered.length > 1 ? filtered : history, count: filtered.length });
+
+  res.json({
+    slug,
+    history: filtered.length > 1 ? filtered : history,
+    count: filtered.length,
+    source: 'portal'
+  });
 });
 
-app.get('/api/ton', (req, res) => res.json({ usd: tonUsd, updated: Date.now() }));
+// GET /api/ton — курс TON/USD
+app.get('/api/ton', (req, res) => {
+  res.json({ usd: tonUsd, updated: Date.now() });
+});
 
-app.get('/api/health', (req, res) => res.json({
-  ok: true,
-  collections: collectionsCache?.length || 0,
-  ton_usd: tonUsd,
-  last_update: new Date(lastFetch).toISOString()
-}));
-
-// ── Telegram Webhook (если нужен) ──────────────────────────────────
-// Раскомментируй если хочешь webhook вместо polling
-// const { handleUpdate } = require('./bot');
-// app.post('/webhook', async (req, res) => {
-//   await handleUpdate(req.body);
-//   res.sendStatus(200);
-// });
+// GET /api/health
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    collections: collectionsCache?.length || 0,
+    ton_usd: tonUsd,
+    last_update: new Date(lastFetch).toISOString()
+  });
+});
 
 const PORT = process.env.PORT || 3333;
 app.listen(PORT, () => {
-  console.log(`\n🚀 GiftMarket Proxy → http://localhost:${PORT}`);
-  console.log(`   Prices: http://localhost:${PORT}/api/prices`);
-  console.log(`   Health: http://localhost:${PORT}/api/health\n`);
+  console.log(`\n🚀 GiftMarket Proxy running on :${PORT}`);
+  console.log(`   GET http://localhost:${PORT}/api/prices`);
+  console.log(`   GET http://localhost:${PORT}/api/history/:slug`);
+  console.log(`   GET http://localhost:${PORT}/api/ton\n`);
 });
