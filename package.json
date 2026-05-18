@@ -1,0 +1,16 @@
+{
+  "name": "giftmarket-proxy",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.1",
+    "cors": "^2.8.5",
+    "node-fetch": "^2.7.0"
+  }
+}
