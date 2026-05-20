@@ -244,21 +244,63 @@ app.get('/api/ton', (req,res) => res.json({usd:tonUsd,updated:Date.now()}));
 
 // Профиль
 app.post('/api/profile', (req,res) => {
-  const {tgId,name,username,avatar} = req.body;
+  const {tgId,name,username,avatar,walletAddress,walletBalance,gifts} = req.body;
   if (!tgId) return res.status(400).json({error:'tgId required'});
   const id = String(tgId);
+  const safeGifts = Array.isArray(gifts) ? gifts.slice(0,100).map(g => ({
+    address: String(g.address||''),
+    name: String(g.name||'Telegram Gift').slice(0,120),
+    image: String(g.image||''),
+    collection: String(g.collection||'Telegram NFT').slice(0,120),
+    url: String(g.url||'')
+  })) : undefined;
+  const wallet = walletAddress ? {
+    address: String(walletAddress),
+    balance: Math.max(0, Number(walletBalance||0) || 0),
+    updatedAt: Date.now()
+  } : undefined;
+
   if (!userProfiles[id]) {
-    userProfiles[id] = {id,name,username,avatar,gifts:[],joinedAt:Date.now(),games:{wins:0,losses:0}};
+    userProfiles[id] = {
+      id,
+      name:name||'Пользователь',
+      username:username||'',
+      avatar:avatar||null,
+      gifts:safeGifts||[],
+      wallet: wallet||null,
+      joinedAt:Date.now(),
+      updatedAt:Date.now(),
+      games:{wins:0,losses:0}
+    };
   } else {
-    userProfiles[id] = {...userProfiles[id],name:name||userProfiles[id].name,username:username||userProfiles[id].username,avatar:avatar||userProfiles[id].avatar};
+    userProfiles[id] = {
+      ...userProfiles[id],
+      name:name||userProfiles[id].name,
+      username:username||userProfiles[id].username,
+      avatar:avatar||userProfiles[id].avatar,
+      updatedAt:Date.now()
+    };
+    if (wallet !== undefined) userProfiles[id].wallet = wallet;
+    if (safeGifts !== undefined) userProfiles[id].gifts = safeGifts;
   }
   res.json(userProfiles[id]);
 });
 
 app.get('/api/profile/:tgId', (req,res) => {
-  const p = userProfiles[req.params.tgId];
+  const p = userProfiles[String(req.params.tgId)];
   if (!p) return res.status(404).json({error:'not found'});
   res.json(p);
+});
+
+// Быстрое обновление кошелька/подарков профиля
+app.post('/api/profile/:tgId/wallet', (req,res) => {
+  const id = String(req.params.tgId);
+  if (!userProfiles[id]) userProfiles[id] = {id,name:'Пользователь',username:'',avatar:null,gifts:[],joinedAt:Date.now(),games:{wins:0,losses:0}};
+  const {walletAddress,walletBalance,gifts} = req.body;
+  userProfiles[id].wallet = walletAddress ? {address:String(walletAddress),balance:Math.max(0,Number(walletBalance||0)||0),updatedAt:Date.now()} : null;
+  userProfiles[id].gifts = Array.isArray(gifts) ? gifts.slice(0,100) : [];
+  userProfiles[id].updatedAt = Date.now();
+  res.json(userProfiles[id]);
 });
 
 // Онлайн
