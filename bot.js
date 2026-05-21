@@ -3,13 +3,14 @@
  */
 const https = require('https');
 
-const TOKEN = process.env.BOT_TOKEN || '8835242049:AAFoXfvA6BhagyvTWZ7d_Z0xx-Wp-yuzgX0';
+const TOKEN = process.env.BOT_TOKEN || ''; // задаётся в Railway Variables
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://stepik-tech.github.io/market/';
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/CursorGift_bot';
 const BANNER_URL = 'https://i.imgur.com/HxHHYuf.png'; // твой баннер
 
 function api(method, data) {
   return new Promise((resolve) => {
+    if (!TOKEN) { console.warn('[Bot] BOT_TOKEN is not set'); return resolve({ ok:false, error:'BOT_TOKEN is not set' }); }
     const body = JSON.stringify(data);
     const req = https.request({
       hostname: 'api.telegram.org',
