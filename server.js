@@ -141,6 +141,72 @@ function sendProfile(res, profile) {
   return res.json({ success: true, data: profile, ...profile });
 }
 
+
+async function fetchTelegramAvatar(tgId) {
+  if (!BOT_TOKEN || !tgId) return null;
+  try {
+    const photosRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getUserProfilePhotos`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ user_id: Number(tgId), limit: 1 })
+    });
+    const photosJson = await photosRes.json();
+    const sizes = photosJson?.result?.photos?.[0];
+    if (!photosJson.ok || !Array.isArray(sizes) || !sizes.length) return null;
+    const best = sizes[sizes.length - 1];
+    const fileRes = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/getFile`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({ file_id: best.file_id })
+    });
+    const fileJson = await fileRes.json();
+    const filePath = fileJson?.result?.file_path;
+    return fileJson.ok && filePath ? `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}` : null;
+  } catch(e) {
+    console.warn('[Profiles] Cannot fetch Telegram avatar:', e.message);
+    return null;
+  }
+}
+
+async function upsertProfileFromBotUser(user) {
+  if (!user?.id) return null;
+  const tgId = normalizeTgId(user.id);
+  if (!tgId) return null;
+  const now = new Date().toISOString();
+  const existing = userProfiles[tgId] || null;
+  const firstName = String(user.first_name || existing?.firstName || '').trim();
+  const lastName = String(user.last_name || existing?.lastName || '').trim();
+  const username = normalizeUsername(user.username || existing?.username || '');
+  let avatar = existing?.avatar || null;
+  // Bot API не отдаёт photo_url в message.from, поэтому один раз пробуем получить аватар через getUserProfilePhotos.
+  if (!avatar) avatar = await fetchTelegramAvatar(tgId);
+  const profile = {
+    id: existing?.id || generateProfileId(),
+    tgId,
+    telegramId: tgId,
+    firstName,
+    lastName,
+    name: normalizeName(null, firstName, lastName),
+    username,
+    avatar,
+    isPremium: Boolean(user.is_premium ?? existing?.isPremium),
+    gifts: existing?.gifts || [],
+    wallet: existing?.wallet || null,
+    games: existing?.games || {wins:0,losses:0},
+    joinedAt: existing?.joinedAt || Date.now(),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now
+  };
+  userProfiles[tgId] = profile;
+  scheduleProfilesSave();
+  return profile;
+}
+
+async function upsertProfileFromTelegramUpdate(update) {
+  const user = update?.message?.from || update?.callback_query?.from || update?.inline_query?.from || null;
+  return upsertProfileFromBotUser(user);
+}
+
 // ── Portal Market ─────────────────────────────────────────────────
 async function fetchPortal() {
   try {
@@ -451,6 +517,7 @@ try {
   const { handleUpdate } = require('./bot');
   app.post('/webhook', async (req,res) => {
     res.sendStatus(200);
+    await upsertProfileFromTelegramUpdate(req.body).catch(console.error);
     await handleUpdate(req.body).catch(console.error);
   });
   console.log('[Bot] Webhook route registered');
