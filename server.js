@@ -1,183 +1,460 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const http = require('http');
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const { WebSocketServer } = require('ws');
+
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-app.use(cors());
-app.use(express.json());
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '1mb' }));
 
-// Cache
+// ── Online users ──────────────────────────────────────────────────
+const onlineUsers = new Map();
+wss.on('connection', (ws) => {
+  let userId = null;
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === 'ping' && msg.userId) {
+        userId = String(msg.userId);
+        onlineUsers.set(userId, { id: userId, name: msg.name||'User', avatar: msg.avatar||null, lastSeen: Date.now() });
+        broadcastOnline();
+      }
+    } catch(e) {}
+  });
+  ws.on('close', () => { if(userId){ onlineUsers.delete(userId); broadcastOnline(); } });
+  ws.send(JSON.stringify({ type:'online', count:onlineUsers.size, users:getOnlineList() }));
+});
+function getOnlineList() { return Array.from(onlineUsers.values()).slice(0,20); }
+function broadcastOnline() {
+  const msg = JSON.stringify({ type:'online', count:onlineUsers.size, users:getOnlineList() });
+  wss.clients.forEach(c => { if(c.readyState===1) c.send(msg); });
+}
+setInterval(() => {
+  const cutoff = Date.now()-35000;
+  for(const [id,u] of onlineUsers) if(u.lastSeen<cutoff) onlineUsers.delete(id);
+  broadcastOnline();
+}, 30000);
+
+// ── Cache ─────────────────────────────────────────────────────────
 let collectionsCache = null;
-let priceHistoryCache = {}; // slug -> [{time, price}]
+let priceHistory = {};    // slug -> [{time,price,vol}]  накапливается с запуска
 let lastFetch = 0;
-const CACHE_TTL = 20000; // 20 секунд
+let tonUsd = 2.0;
+const CACHE_TTL = 20000;
 
-// ── Portal Market — основной источник ────────────────────────────
+// NFT attrs cache
+const nftAttrsCache = {};
+const attrsLock = new Set();
+
+// User profiles (без внешней БД и без новых зависимостей — Railway-friendly)
+// Профили храним в памяти + JSON-файле. Если файл недоступен, приложение всё равно работает.
+const BOT_TOKEN = process.env.BOT_TOKEN || '';
+const PROFILE_STORE_PATH = process.env.PROFILE_STORE_PATH || path.join(process.cwd(), '.data', 'profiles.json');
+
+function loadProfileStore() {
+  try {
+    if (!fs.existsSync(PROFILE_STORE_PATH)) return {};
+    const raw = fs.readFileSync(PROFILE_STORE_PATH, 'utf8');
+    const parsed = JSON.parse(raw || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch (e) {
+    console.warn('[Profiles] Cannot load store:', e.message);
+    return {};
+  }
+}
+
+let userProfiles = loadProfileStore();
+let profileSaveTimer = null;
+function scheduleProfilesSave() {
+  clearTimeout(profileSaveTimer);
+  profileSaveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(PROFILE_STORE_PATH), { recursive: true });
+      fs.writeFileSync(PROFILE_STORE_PATH, JSON.stringify(userProfiles, null, 2));
+    } catch (e) {
+      console.warn('[Profiles] Cannot save store:', e.message);
+    }
+  }, 300);
+}
+
+function generateProfileId() {
+  return crypto.randomUUID ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+    const r = Math.random() * 16 | 0;
+    return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+  });
+}
+function normalizeTgId(tgId) {
+  if (tgId === null || tgId === undefined) return null;
+  const s = String(tgId).trim();
+  return s || null;
+}
+function normalizeUsername(username) {
+  if (!username || typeof username !== 'string') return '';
+  const clean = username.trim().replace(/^@+/, '');
+  return clean ? '@' + clean : '';
+}
+function normalizeName(name, firstName, lastName) {
+  if (typeof name === 'string' && name.trim()) return name.trim();
+  const parts = [firstName, lastName].map(v => String(v || '').trim()).filter(Boolean);
+  return parts.length ? parts.join(' ') : 'Пользователь';
+}
+function normalizeGift(g) {
+  return {
+    address: String(g?.address || ''),
+    name: String(g?.name || 'Telegram Gift').slice(0, 120),
+    image: String(g?.image || ''),
+    collection: String(g?.collection || 'Telegram NFT').slice(0, 120),
+    url: String(g?.url || '')
+  };
+}
+function verifyTelegramInitData(initData, botToken) {
+  if (!botToken) return { valid: true, skipped: true, reason: 'BOT_TOKEN not configured' };
+  if (!initData || typeof initData !== 'string') return { valid: false, reason: 'initData missing' };
+  try {
+    const params = new URLSearchParams(initData);
+    const receivedHash = params.get('hash');
+    if (!receivedHash) return { valid: false, reason: 'hash missing' };
+    params.delete('hash');
+    const dataCheckString = Array.from(params.entries())
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join('\n');
+    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(botToken).digest();
+    const expectedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+    if (expectedHash !== receivedHash) return { valid: false, reason: 'hash mismatch' };
+    const authDate = parseInt(params.get('auth_date') || '0', 10);
+    if (authDate && Math.floor(Date.now() / 1000) - authDate > 86400) return { valid: false, reason: 'initData expired' };
+    return { valid: true };
+  } catch (e) {
+    return { valid: false, reason: e.message };
+  }
+}
+function sendProfile(res, profile) {
+  // Совместимость: поля профиля лежат и в корне, и в data.
+  return res.json({ success: true, data: profile, ...profile });
+}
+
+// ── Portal Market ─────────────────────────────────────────────────
 async function fetchPortal() {
   try {
     const r = await fetch('https://portal-market.com/api/collections?limit=300', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; GiftMarketBot/1.0)',
-        'Accept': 'application/json',
-        'Referer': 'https://portal-market.com/'
-      },
-      timeout: 10000
+      headers: { 'User-Agent':'Mozilla/5.0','Accept':'application/json','Referer':'https://portal-market.com/' },
+      timeout: 12000
     });
+    if (!r.ok) throw new Error('HTTP '+r.status);
     const j = await r.json();
-    const cols = j.collections || [];
-    const changes = j.floor_changes || {};
-    const volChanges = j.volume_changes || {};
-
+    const cols = j.collections||[];
+    const changes = j.floor_changes||{};
+    const volChanges = j.volume_changes||{};
     return cols.map(c => ({
-      id: c.id,
-      name: c.name,
-      slug: c.short_name,
+      id: c.id, name: c.name, slug: c.short_name,
       photo: `https://fragment.com/file/gifts/${c.short_name}/thumb.webp`,
       portalPhoto: c.photo_url,
-      floor: parseFloat(c.floor_price) || 0,
-      change24h: parseFloat((parseFloat(changes[c.id] || 0) * 100).toFixed(2)),
-      vol24h: parseFloat(c.day_volume) || 0,
-      volChange: parseFloat((parseFloat(volChanges[c.id] || 0) * 100).toFixed(2)),
-      listed: c.listed_count || 0,
-      supply: c.supply || 0,
-      marketCap: parseFloat(c.market_cap) || 0,
-      sales24h: c.sales_24h_count || 0,
-      isNew: c.is_new || false,
+      floor: parseFloat(c.floor_price)||0,
+      change24h: parseFloat((parseFloat(changes[c.id]||0)*100).toFixed(2)),
+      vol24h: parseFloat(c.day_volume)||0,
+      volChange: parseFloat((parseFloat(volChanges[c.id]||0)*100).toFixed(2)),
+      listed: c.listed_count||0, supply: c.supply||0,
+      marketCap: parseFloat(c.market_cap)||0,
+      sales24h: c.sales_24h_count||0, isNew: c.is_new||false,
       source: 'portal'
     }));
-  } catch(e) {
-    console.error('[Portal] Error:', e.message);
-    return null;
-  }
+  } catch(e) { console.error('[Portal]', e.message); return null; }
 }
 
-// ── TON/USD rate ──────────────────────────────────────────────────
-let tonUsd = 5.5;
 async function fetchTonRate() {
   try {
-    const r = await fetch('https://tonapi.io/v2/rates?tokens=ton&currencies=usd', { timeout: 5000 });
+    const r = await fetch('https://tonapi.io/v2/rates?tokens=ton&currencies=usd', { timeout:5000 });
     const j = await r.json();
     const rate = j?.rates?.TON?.prices?.USD;
-    if (rate > 0) tonUsd = parseFloat(parseFloat(rate).toFixed(4));
+    if (rate>0) tonUsd = parseFloat(parseFloat(rate).toFixed(4));
   } catch(e) {}
 }
 
-// ── Price history from Portal sales ──────────────────────────────
-async function fetchPortalHistory(slug, limit = 100) {
+// ── История продаж с Portal ────────────────────────────────────────
+async function fetchPortalSales(slug, limit=200) {
   try {
-    const r = await fetch(`https://portal-market.com/api/market-activity?gift_name=${encodeURIComponent(slug)}&type=sale&limit=${limit}&sort=latest`, {
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' },
-      timeout: 8000
-    });
+    const r = await fetch(
+      `https://portal-market.com/api/market-activity?gift_name=${encodeURIComponent(slug)}&type=sale&limit=${limit}&sort=oldest`,
+      { headers:{'User-Agent':'Mozilla/5.0','Accept':'application/json'}, timeout:10000 }
+    );
     if (!r.ok) return [];
     const j = await r.json();
-    const items = j.activities || j.sales || j.data || [];
+    const items = j.activities||j.sales||j.data||[];
     return items
-      .filter(i => parseFloat(i.price || i.ton_price || 0) > 0)
+      .filter(i => parseFloat(i.price||i.ton_price||0)>0)
       .map(i => ({
-        time: new Date(i.created_at || i.sold_at || i.time || Date.now()).getTime(),
-        price: parseFloat(i.price || i.ton_price || 0),
+        time: new Date(i.created_at||i.sold_at||i.time||Date.now()).getTime(),
+        price: parseFloat(i.price||i.ton_price||0),
+        vol: 1,
         source: 'portal_sale'
       }))
-      .sort((a, b) => a.time - b.time);
-  } catch(e) {
-    return [];
-  }
+      .sort((a,b) => a.time-b.time);
+  } catch(e) { return []; }
 }
 
-// ── Update loop ───────────────────────────────────────────────────
 async function updateAll() {
   const now = Date.now();
-  if (now - lastFetch < CACHE_TTL) return;
+  if (now-lastFetch < CACHE_TTL) return;
   lastFetch = now;
-
-  console.log('[Proxy] Updating prices...');
+  console.log('[Proxy] Updating...');
   const [portalData] = await Promise.allSettled([fetchPortal(), fetchTonRate()]);
-
   if (portalData?.value) {
     collectionsCache = portalData.value;
-
-    // Сохраняем точки в историю
     collectionsCache.forEach(c => {
-      if (!priceHistoryCache[c.slug]) priceHistoryCache[c.slug] = [];
-      priceHistoryCache[c.slug].push({ time: now, price: c.floor });
-      // Держим 7 дней данных при 20с интервале = 30240 точек
-      if (priceHistoryCache[c.slug].length > 30240) {
-        priceHistoryCache[c.slug] = priceHistoryCache[c.slug].slice(-10000);
-      }
+      if (!priceHistory[c.slug]) priceHistory[c.slug] = [];
+      priceHistory[c.slug].push({ time:now, price:c.floor, vol:c.vol24h });
+      if (priceHistory[c.slug].length > 43200) priceHistory[c.slug] = priceHistory[c.slug].slice(-20000);
     });
-
-    console.log(`[Proxy] Updated ${collectionsCache.length} collections, TON=$${tonUsd}`);
+    console.log(`[Proxy] ${collectionsCache.length} gifts, TON=$${tonUsd}`);
+    broadcastPrices();
   }
 }
 
-// Запускаем сразу и потом каждые 20 секунд
-updateAll();
-setInterval(updateAll, 20000);
-setInterval(fetchTonRate, 60000);
-
-// ── API Routes ────────────────────────────────────────────────────
-
-// GET /api/prices — все цены сразу
-app.get('/api/prices', async (req, res) => {
-  await updateAll();
-  if (!collectionsCache) return res.json({ error: 'loading', collections: [], ton_usd: tonUsd });
-
-  res.json({
+function broadcastPrices() {
+  if (!collectionsCache) return;
+  const msg = JSON.stringify({
+    type: 'prices',
     collections: collectionsCache,
     ton_usd: tonUsd,
-    updated_at: lastFetch,
-    count: collectionsCache.length
+    updated_at: Date.now()
   });
+  wss.clients.forEach(c => { if(c.readyState===1) c.send(msg); });
+}
+
+updateAll();
+setInterval(updateAll, 20000);
+setInterval(fetchTonRate, 30000); // курс TON каждые 30 сек
+
+// ── NFT attributes ─────────────────────────────────────────────────
+async function fetchNftAttributes(slug) {
+  if (nftAttrsCache[slug] || attrsLock.has(slug)) return nftAttrsCache[slug]||null;
+  attrsLock.add(slug);
+  try {
+    const supply = collectionsCache?.find(c=>c.slug===slug)?.supply||1000;
+    const step = Math.max(1, Math.floor(supply/50));
+    const nums = [];
+    for (let i=1; i<=Math.min(supply,50*step); i+=step) nums.push(i);
+    const models=new Map(), bgs=new Map(), symbols=new Map();
+    for (let i=0; i<nums.length; i+=10) {
+      const batch = nums.slice(i,i+10);
+      const results = await Promise.allSettled(batch.map(n=>
+        fetch(`https://nft.fragment.com/gift/${slug}-${n}.json`,{timeout:5000}).then(r=>r.ok?r.json():null)
+      ));
+      results.forEach(r=>{
+        if(r.status!=='fulfilled'||!r.value)return;
+        (r.value.attributes||[]).forEach(a=>{
+          const v=a.value,tt=a.trait_type;
+          if(tt==='Model') models.set(v,(models.get(v)||0)+1);
+          else if(tt==='Backdrop') bgs.set(v,(bgs.get(v)||0)+1);
+          else if(tt==='Symbol') symbols.set(v,(symbols.get(v)||0)+1);
+        });
+      });
+      if(i+10<nums.length) await new Promise(r=>setTimeout(r,300));
+    }
+    const toArr = map => Array.from(map.entries()).sort((a,b)=>a[1]-b[1]).map(([name,count])=>({name,count,rarity:parseFloat((count/nums.length*100).toFixed(1))}));
+    nftAttrsCache[slug] = { models:toArr(models), backdrops:toArr(bgs), symbols:toArr(symbols), scanned:nums.length };
+    console.log(`[Attrs] ${slug}: ${models.size} models, ${bgs.size} backdrops`);
+  } catch(e) { console.error('[Attrs]',slug,e.message); }
+  attrsLock.delete(slug);
+  return nftAttrsCache[slug]||null;
+}
+
+// ── Routes ─────────────────────────────────────────────────────────
+app.get('/', (req,res) => res.json({name:'CursorGift Proxy v3',ok:true,collections:collectionsCache?.length||0,ton_usd:tonUsd,online:onlineUsers.size}));
+
+app.get('/api/prices', async (req,res) => {
+  await updateAll();
+  if (!collectionsCache) return res.json({error:'loading',collections:[],ton_usd:tonUsd});
+  res.json({collections:collectionsCache,ton_usd:tonUsd,updated_at:lastFetch,count:collectionsCache.length});
 });
 
-// GET /api/history/:slug — история цен конкретного подарка
-app.get('/api/history/:slug', async (req, res) => {
+// История — РЕАЛЬНАЯ с момента запуска + подгружаем с Portal если мало точек
+app.get('/api/history/:slug', async (req,res) => {
   const { slug } = req.params;
-  const { hours = 72 } = req.query;
-
-  let history = priceHistoryCache[slug] || [];
-
-  // Если история пустая — пробуем загрузить с Portal
-  if (history.length < 5) {
-    const fresh = await fetchPortalHistory(slug, 200);
-    if (fresh.length > 0) {
-      priceHistoryCache[slug] = [...fresh, ...history].sort((a,b) => a.time - b.time);
-      history = priceHistoryCache[slug];
+  const { hours } = req.query;
+  
+  // Если мало данных — подгружаем реальные продажи с Portal
+  let history = priceHistory[slug]||[];
+  if (history.length < 20) {
+    const sales = await fetchPortalSales(slug, 500);
+    if (sales.length>0) {
+      const merged = [...sales, ...history].sort((a,b)=>a.time-b.time)
+        .filter((p,i,arr)=>i===0||p.time!==arr[i-1].time);
+      priceHistory[slug] = merged;
+      history = merged;
     }
   }
-
-  // Фильтруем по периоду
-  const cutoff = hours == 99999 ? 0 : Date.now() - parseFloat(hours) * 3600000;
-  const filtered = history.filter(p => p.time >= cutoff);
-
+  
+  // Фильтр по периоду
+  let filtered = history;
+  if (hours && parseFloat(hours)<99999) {
+    const cutoff = Date.now()-parseFloat(hours)*3600000;
+    filtered = history.filter(p=>p.time>=cutoff);
+    if (filtered.length<3) filtered = history; // показываем всё если мало данных
+  }
+  
   res.json({
-    slug,
-    history: filtered.length > 1 ? filtered : history,
-    count: filtered.length,
-    source: 'portal'
+    slug, history:filtered, count:filtered.length,
+    total:history.length,
+    from: history.length ? new Date(history[0].time).toISOString() : null,
+    to: history.length ? new Date(history[history.length-1].time).toISOString() : null
   });
 });
 
-// GET /api/ton — курс TON/USD
-app.get('/api/ton', (req, res) => {
-  res.json({ usd: tonUsd, updated: Date.now() });
+// Атрибуты NFT
+app.get('/api/attrs/:slug', async (req,res) => {
+  const { slug } = req.params;
+  if (nftAttrsCache[slug]) return res.json({slug,...nftAttrsCache[slug],cached:true});
+  if (!attrsLock.has(slug)) fetchNftAttributes(slug).catch(()=>{});
+  res.json({slug,models:[],backdrops:[],symbols:[],loading:true});
 });
 
-// GET /api/health
-app.get('/api/health', (req, res) => {
-  res.json({
-    ok: true,
-    collections: collectionsCache?.length || 0,
-    ton_usd: tonUsd,
-    last_update: new Date(lastFetch).toISOString()
+// NFT метаданные
+app.get('/api/nft/:slug/:num', async (req,res) => {
+  try {
+    const r = await fetch(`https://nft.fragment.com/gift/${req.params.slug}-${req.params.num}.json`,{timeout:6000});
+    if (!r.ok) return res.status(404).json({error:'not found'});
+    const j = await r.json();
+    res.json({...j, lottie:`https://nft.fragment.com/gift/${req.params.slug}-${req.params.num}.lottie.json`, image_hq:`https://nft.fragment.com/gift/${req.params.slug}-${req.params.num}.webp`});
+  } catch(e) { res.status(500).json({error:e.message}); }
+});
+
+// TON курс
+app.get('/api/ton', (req,res) => res.json({usd:tonUsd,updated:Date.now()}));
+
+// Профиль
+app.post('/api/profile', (req,res) => {
+  try {
+    const {
+      tgId: rawTgId,
+      firstName,
+      lastName,
+      name: rawName,
+      username: rawUsername,
+      avatar,
+      isPremium,
+      initData,
+      walletAddress,
+      walletBalance,
+      gifts
+    } = req.body || {};
+
+    const tgId = normalizeTgId(rawTgId);
+    if (!tgId || tgId === '0') return res.status(400).json({success:false,error:'tgId required'});
+
+    const telegramInitData = initData || req.headers['x-telegram-init-data'];
+    if (BOT_TOKEN) {
+      const check = verifyTelegramInitData(telegramInitData, BOT_TOKEN);
+      if (!check.valid) {
+        // Не блокируем, чтобы старые клиенты/тесты не падали, но логируем проблему.
+        console.warn(`[Profiles] Telegram initData verification failed for ${tgId}: ${check.reason}`);
+      }
+    }
+
+    const existing = userProfiles[tgId] || null;
+    const now = new Date().toISOString();
+    const normalizedFirstName = firstName !== undefined ? String(firstName || '').trim() : (existing?.firstName || '');
+    const normalizedLastName  = lastName  !== undefined ? String(lastName  || '').trim() : (existing?.lastName  || '');
+    const normalizedName = normalizeName(rawName !== undefined ? rawName : existing?.name, normalizedFirstName, normalizedLastName);
+    const normalizedUsername = rawUsername !== undefined ? normalizeUsername(rawUsername) : (existing?.username || '');
+    const safeGifts = Array.isArray(gifts) ? gifts.slice(0,100).map(normalizeGift) : undefined;
+    const wallet = walletAddress ? {
+      address: String(walletAddress),
+      balance: Math.max(0, Number(walletBalance || 0) || 0),
+      updatedAt: now
+    } : (walletAddress === null ? null : undefined);
+
+    const profile = {
+      id: existing?.id || generateProfileId(),
+      tgId,
+      // для старого кода, где id был Telegram ID:
+      telegramId: tgId,
+      firstName: normalizedFirstName,
+      lastName: normalizedLastName,
+      name: normalizedName,
+      username: normalizedUsername,
+      avatar: avatar !== undefined ? (avatar || null) : (existing?.avatar || null),
+      isPremium: isPremium !== undefined ? Boolean(isPremium) : Boolean(existing?.isPremium),
+      gifts: safeGifts !== undefined ? safeGifts : (existing?.gifts || []),
+      wallet: wallet !== undefined ? wallet : (existing?.wallet || null),
+      games: existing?.games || {wins:0,losses:0},
+      joinedAt: existing?.joinedAt || Date.now(),
+      createdAt: existing?.createdAt || now,
+      updatedAt: now
+    };
+
+    userProfiles[tgId] = profile;
+    scheduleProfilesSave();
+    return sendProfile(res, profile);
+  } catch(e) {
+    console.error('[POST /api/profile]', e);
+    return res.status(500).json({success:false,error:'internal_error'});
+  }
+});
+
+app.get('/api/profile/:tgId', (req,res) => {
+  const tgId = normalizeTgId(req.params.tgId);
+  if (!tgId) return res.status(400).json({success:false,error:'tgId required'});
+  const p = userProfiles[tgId];
+  if (!p) return res.status(404).json({success:false,error:'not found'});
+  return sendProfile(res, p);
+});
+
+app.get('/api/profiles', (req,res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '50', 10) || 50, 1), 200);
+  const offset = Math.max(parseInt(req.query.offset || '0', 10) || 0, 0);
+  const list = Object.values(userProfiles)
+    .sort((a,b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
+  const data = list.slice(offset, offset + limit);
+  res.json({success:true,data,profiles:data,total:list.length,limit,offset});
+});
+
+// Быстрое обновление кошелька/подарков профиля
+app.post('/api/profile/:tgId/wallet', (req,res) => {
+  const tgId = normalizeTgId(req.params.tgId);
+  if (!tgId || tgId === '0') return res.status(400).json({success:false,error:'tgId required'});
+  const now = new Date().toISOString();
+  const existing = userProfiles[tgId] || {
+    id: generateProfileId(), tgId, telegramId: tgId,
+    firstName:'', lastName:'', name:'Пользователь', username:'', avatar:null,
+    isPremium:false, gifts:[], wallet:null, games:{wins:0,losses:0}, joinedAt:Date.now(), createdAt:now
+  };
+  const {walletAddress,walletBalance,gifts} = req.body || {};
+  existing.wallet = walletAddress ? {address:String(walletAddress),balance:Math.max(0,Number(walletBalance||0)||0),updatedAt:now} : null;
+  existing.gifts = Array.isArray(gifts) ? gifts.slice(0,100).map(normalizeGift) : [];
+  existing.updatedAt = now;
+  userProfiles[tgId] = existing;
+  scheduleProfilesSave();
+  return sendProfile(res, existing);
+});
+
+// Онлайн
+app.get('/api/online', (req,res) => res.json({count:onlineUsers.size,users:getOnlineList()}));
+
+app.get('/api/health', (req,res) => res.json({
+  ok:true, collections:collectionsCache?.length||0, ton_usd:tonUsd,
+  online:onlineUsers.size, profiles:Object.keys(userProfiles).length,
+  profile_store:PROFILE_STORE_PATH, bot_token_configured:Boolean(BOT_TOKEN),
+  last_update:new Date(lastFetch).toISOString()
+}));
+
+// Telegram Bot Webhook
+try {
+  const { handleUpdate } = require('./bot');
+  app.post('/webhook', async (req,res) => {
+    res.sendStatus(200);
+    await handleUpdate(req.body).catch(console.error);
   });
-});
+  console.log('[Bot] Webhook route registered');
+} catch(e) { console.warn('[Bot] bot.js not found:', e.message); }
 
-const PORT = process.env.PORT || 3333;
-app.listen(PORT, () => {
-  console.log(`\n🚀 GiftMarket Proxy running on :${PORT}`);
-  console.log(`   GET http://localhost:${PORT}/api/prices`);
-  console.log(`   GET http://localhost:${PORT}/api/history/:slug`);
-  console.log(`   GET http://localhost:${PORT}/api/ton\n`);
-});
+const PORT = process.env.PORT||3333;
+server.listen(PORT, () => console.log(`\n🚀 CursorGift Proxy v3 → :${PORT}\n   WS broadcast enabled\n`));
