@@ -8,6 +8,18 @@ const WEBAPP_URL = process.env.WEBAPP_URL || 'https://stepik-tech.github.io/mark
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/CursorGift_bot';
 const BANNER_URL = 'https://i.imgur.com/HxHHYuf.png'; // твой баннер
 
+function webAppUrlFor(user) {
+  try {
+    const u = new URL(WEBAPP_URL);
+    if (user?.id) u.searchParams.set('tgId', String(user.id));
+    u.searchParams.set('fromBot', '1');
+    return u.toString();
+  } catch(e) {
+    const sep = WEBAPP_URL.includes('?') ? '&' : '?';
+    return WEBAPP_URL + sep + 'tgId=' + encodeURIComponent(user?.id || '') + '&fromBot=1';
+  }
+}
+
 function api(method, data) {
   return new Promise((resolve) => {
     if (!TOKEN) { console.warn('[Bot] BOT_TOKEN is not set'); return resolve({ ok:false, error:'BOT_TOKEN is not set' }); }
@@ -33,6 +45,7 @@ async function handleUpdate(update) {
 
   const chatId = msg.chat.id;
   const text = (msg.text || '').split(' ')[0].replace('@CursorGift_bot', '');
+  const appUrl = webAppUrlFor(msg.from);
 
   // Любая команда или сообщение → баннер
   await api('sendPhoto', {
@@ -48,7 +61,7 @@ async function handleUpdate(update) {
     parse_mode: 'Markdown',
     reply_markup: {
       inline_keyboard: [
-        [{ text: '🚀 Открыть CursorGift', web_app: { url: WEBAPP_URL } }],
+        [{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }],
         [
           { text: '📢 Наш канал', url: CHANNEL_URL },
         ]
