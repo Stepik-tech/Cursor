@@ -102,12 +102,7 @@ function apiMultipart(method, fields, fileField, filePath, filename = 'banner.jp
 }
 
 function captionText() {
-  return 'Cursor Market — рынок Telegram подарков\n\n' +
-    '📊 Live цены подарков\n' +
-    '📈 Графики и аналитика\n' +
-    '📺 Pepe Upgrade Terminal\n' +
-    '💎 TON кошелёк и профиль\n\n' +
-    'Нажми кнопку ниже, чтобы открыть приложение.';
+  return 'Cursor Market — рынок Telegram подарков\n\n'
 }
 
 function inlineOpenMarkup(appUrl) {
