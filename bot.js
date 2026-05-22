@@ -1,15 +1,16 @@
 /**
- * CursorGift Bot — /start, persistent Open button, local banner upload
+ * Cursor Market Bot — /start, open buttons, local banner upload
+ * ВАЖНО: BOT_TOKEN задаётся только в Railway Variables, не в коде.
  */
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
 
-const TOKEN = process.env.BOT_TOKEN || ''; // задаётся в Railway Variables
+const TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || process.env.TOKEN || '';
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://stepik-tech.github.io/market/';
-const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/CursorGift_bot';
+const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/Cursor_Market';
 const BANNER_FILE = process.env.BANNER_FILE || path.join(__dirname, 'banner.jpg');
-const FALLBACK_BANNER_URL = process.env.BANNER_URL || ''; // можно задать file_id или стабильный URL, если нужен
+const FALLBACK_BANNER_URL = process.env.BANNER_URL || '';
 
 function webAppUrlFor(user) {
   try {
@@ -17,7 +18,7 @@ function webAppUrlFor(user) {
     if (user?.id) u.searchParams.set('tgId', String(user.id));
     u.searchParams.set('fromBot', '1');
     return u.toString();
-  } catch(e) {
+  } catch (e) {
     const sep = WEBAPP_URL.includes('?') ? '&' : '?';
     return WEBAPP_URL + sep + 'tgId=' + encodeURIComponent(user?.id || '') + '&fromBot=1';
   }
@@ -25,29 +26,41 @@ function webAppUrlFor(user) {
 
 function api(method, data) {
   return new Promise((resolve) => {
-    if (!TOKEN) { console.warn('[Bot] BOT_TOKEN is not set'); return resolve({ ok:false, error:'BOT_TOKEN is not set' }); }
-    const body = JSON.stringify(data);
+    if (!TOKEN) {
+      console.warn('[Bot] BOT_TOKEN is not set');
+      return resolve({ ok: false, error: 'BOT_TOKEN is not set' });
+    }
+
+    const body = JSON.stringify(data || {});
     const req = https.request({
       hostname: 'api.telegram.org',
       path: `/bot${TOKEN}/${method}`,
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body)
+      }
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ ok:false, raw:d }); } });
+      res.on('end', () => {
+        try { resolve(JSON.parse(d)); }
+        catch (e) { resolve({ ok: false, raw: d }); }
+      });
     });
-    req.on('error', e => resolve({ ok:false, error:e.message }));
-    req.write(body); req.end();
+
+    req.on('error', e => resolve({ ok: false, error: e.message }));
+    req.write(body);
+    req.end();
   });
 }
 
-function apiMultipart(method, fields, fileField, filePath, filename='banner.jpg', contentType='image/jpeg') {
+function apiMultipart(method, fields, fileField, filePath, filename = 'banner.jpg', contentType = 'image/jpeg') {
   return new Promise((resolve) => {
-    if (!TOKEN) return resolve({ ok:false, error:'BOT_TOKEN is not set' });
-    if (!fs.existsSync(filePath)) return resolve({ ok:false, error:'file not found' });
+    if (!TOKEN) return resolve({ ok: false, error: 'BOT_TOKEN is not set' });
+    if (!fs.existsSync(filePath)) return resolve({ ok: false, error: 'file not found: ' + filePath });
 
-    const boundary = '----CursorGiftBoundary' + Date.now().toString(16);
+    const boundary = '----CursorMarketBoundary' + Date.now().toString(16);
     const chunks = [];
     const add = v => chunks.push(Buffer.isBuffer(v) ? v : Buffer.from(String(v)));
 
@@ -69,49 +82,82 @@ function apiMultipart(method, fields, fileField, filePath, filename='banner.jpg'
       hostname: 'api.telegram.org',
       path: `/bot${TOKEN}/${method}`,
       method: 'POST',
-      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length
+      }
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ ok:false, raw:d }); } });
+      res.on('end', () => {
+        try { resolve(JSON.parse(d)); }
+        catch (e) { resolve({ ok: false, raw: d }); }
+      });
     });
-    req.on('error', e => resolve({ ok:false, error:e.message }));
-    req.write(body); req.end();
+
+    req.on('error', e => resolve({ ok: false, error: e.message }));
+    req.write(body);
+    req.end();
   });
 }
 
 function captionText() {
-  return ` *Cursor Market — рынок Telegram подарков*\n\n` +
+  return 'Cursor Market — рынок Telegram подарков\n\n' +
+    '📊 Live цены подарков\n' +
+    '📈 Графики и аналитика\n' +
+    '📺 Pepe Upgrade Terminal\n' +
+    '💎 TON кошелёк и профиль\n\n' +
+    'Нажми кнопку ниже, чтобы открыть приложение.';
 }
 
 function inlineOpenMarkup(appUrl) {
   return {
     inline_keyboard: [
       [{ text: 'Open Cursor Market', web_app: { url: appUrl } }],
-      [{ text: 'Join the Community ', url: https://t.me/Cursor_Market }]
+      [{ text: 'Join the Community', url: CHANNEL_URL }]
     ]
   };
 }
 
+// Fallback без web_app — если домен Mini App не настроен в BotFather.
+function inlineUrlMarkup(appUrl) {
+  return {
+    inline_keyboard: [
+      [{ text: 'Open Cursor Market', url: appUrl }],
+      [{ text: 'Join the Community', url: CHANNEL_URL }]
+    ]
+  };
+}
+
+function persistentKeyboard(appUrl) {
+  return {
+    keyboard: [[{ text: 'Open Cursor Market', web_app: { url: appUrl } }]],
+    resize_keyboard: true,
+    is_persistent: true,
+    one_time_keyboard: false,
+    input_field_placeholder: 'Open Cursor Market'
+  };
+}
 
 async function setupOpenButtons(chatId, user) {
   const appUrl = webAppUrlFor(user);
 
-  // Кнопка Menu возле поля ввода — остаётся в чате после /start.
-  await api('setChatMenuButton', {
+  // Кнопка Menu возле поля ввода в чате с ботом.
+  const menu = await api('setChatMenuButton', {
     chat_id: chatId,
     menu_button: {
       type: 'web_app',
-      text: 'Открыть',
+      text: 'Open',
       web_app: { url: appUrl }
     }
   });
+  if (!menu?.ok) console.warn('[Bot] setChatMenuButton failed:', menu);
 
-  // Команды, чтобы пользователь видел /start и /open.
+  // Команды бота.
   await api('setMyCommands', {
     commands: [
-      { command: 'start', description: 'Запустить CursorGift' },
-      { command: 'open', description: 'Открыть приложение' }
+      { command: 'start', description: 'Start Cursor Market' },
+      { command: 'open', description: 'Open app' }
     ]
   });
 
@@ -120,66 +166,89 @@ async function setupOpenButtons(chatId, user) {
 
 async function sendStart(chatId, user) {
   const appUrl = await setupOpenButtons(chatId, user);
-  const replyMarkup = inlineOpenMarkup(appUrl);
+  const webAppMarkup = inlineOpenMarkup(appUrl);
+  const urlMarkup = inlineUrlMarkup(appUrl);
 
-  // Локальный upload баннера: не зависит от Imgur и региональных блокировок.
   let sent = null;
+
+  // 1. Баннер локальным файлом + web_app кнопка.
   if (fs.existsSync(BANNER_FILE)) {
     sent = await apiMultipart('sendPhoto', {
       chat_id: String(chatId),
       caption: captionText(),
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup
+      reply_markup: webAppMarkup
     }, 'photo', BANNER_FILE, path.basename(BANNER_FILE), 'image/jpeg');
+    if (!sent?.ok) console.warn('[Bot] sendPhoto with web_app failed:', sent);
   }
 
-  // Если локальный файл почему-то не отправился, пробуем env BANNER_URL/file_id.
+  // 2. Если web_app отклонён — баннер с обычной url кнопкой.
+  if ((!sent || !sent.ok) && fs.existsSync(BANNER_FILE)) {
+    sent = await apiMultipart('sendPhoto', {
+      chat_id: String(chatId),
+      caption: captionText(),
+      reply_markup: urlMarkup
+    }, 'photo', BANNER_FILE, path.basename(BANNER_FILE), 'image/jpeg');
+    if (!sent?.ok) console.warn('[Bot] sendPhoto with url failed:', sent);
+  }
+
+  // 3. Если есть BANNER_URL/file_id — fallback.
   if ((!sent || !sent.ok) && FALLBACK_BANNER_URL) {
     sent = await api('sendPhoto', {
       chat_id: chatId,
       photo: FALLBACK_BANNER_URL,
       caption: captionText(),
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup
+      reply_markup: urlMarkup
     });
+    if (!sent?.ok) console.warn('[Bot] fallback BANNER_URL failed:', sent);
   }
 
-  // Последний fallback — обычное сообщение без картинки.
+  // 4. Текстовый fallback.
   if (!sent || !sent.ok) {
-    await api('sendMessage', {
+    sent = await api('sendMessage', {
       chat_id: chatId,
-      text: captionText(),
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup
+      text: captionText() + '\n\nOpen: ' + appUrl,
+      reply_markup: urlMarkup
     });
+    if (!sent?.ok) console.warn('[Bot] sendMessage fallback failed:', sent);
   }
 
-
+  // 5. Постоянная клавиатура снизу в чате.
+  const kb = await api('sendMessage', {
+    chat_id: chatId,
+    text: '✅ Cursor Market is ready. Use the button below to open it anytime.',
+    reply_markup: persistentKeyboard(appUrl)
+  });
+  if (!kb?.ok) console.warn('[Bot] persistent keyboard failed:', kb);
+}
 
 async function handleUpdate(update) {
   const msg = update.message;
   if (!msg) return;
 
   const chatId = msg.chat.id;
-  const text = (msg.text || '').split(' ')[0].replace('@CursorGift_bot', '');
-
-  // На /start, /open и любое сообщение обновляем постоянную кнопку и показываем открытие.
   await sendStart(chatId, msg.from);
 }
 
 module.exports = { handleUpdate, setupOpenButtons, webAppUrlFor };
 
 if (require.main === module) {
-  console.log('🤖 CursorGift Bot polling...');
+  console.log('🤖 Cursor Market Bot polling...');
   let offset = 0;
+
   async function poll() {
     try {
       const r = await api('getUpdates', { offset, timeout: 30, limit: 100 });
       if (r.ok && r.result?.length) {
-        for (const u of r.result) { offset = u.update_id + 1; await handleUpdate(u).catch(console.error); }
+        for (const u of r.result) {
+          offset = u.update_id + 1;
+          await handleUpdate(u).catch(console.error);
+        }
       }
-    } catch(e) { await new Promise(r => setTimeout(r, 3000)); }
+    } catch (e) {
+      await new Promise(r => setTimeout(r, 3000));
+    }
     poll();
   }
+
   poll();
 }
