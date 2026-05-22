@@ -1,6 +1,6 @@
 /**
- * Cursor Market Bot — /start, open buttons, local banner upload
- * ВАЖНО: BOT_TOKEN задаётся только в Railway Variables, не в коде.
+ * Cursor Market Bot — /start, menu open button, local banner upload
+ * BOT_TOKEN задаётся в Railway Variables.
  */
 const https = require('https');
 const fs = require('fs');
@@ -102,14 +102,19 @@ function apiMultipart(method, fields, fileField, filePath, filename = 'banner.jp
 }
 
 function captionText() {
-  return 'Cursor Market — рынок Telegram подарков\n\n'
+  return 'Cursor Market — рынок Telegram подарков\n\n' +
+    '📊 Live цены подарков\n' +
+    '📈 Графики и аналитика\n' +
+    '📺 Pepe Upgrade Terminal\n' +
+    '💎 TON кошелёк и профиль\n\n' +
+    'Нажми кнопку ниже, чтобы открыть приложение.';
 }
 
 function inlineOpenMarkup(appUrl) {
   return {
     inline_keyboard: [
       [{ text: 'Open Cursor Market', web_app: { url: appUrl } }],
-      { text: 'Join the Community', url: 'https://t.me/Cursor_Market' }
+      [{ text: 'Join the Community', url: CHANNEL_URL }]
     ]
   };
 }
@@ -124,20 +129,11 @@ function inlineUrlMarkup(appUrl) {
   };
 }
 
-function persistentKeyboard(appUrl) {
-  return {
-    keyboard: [[{ text: 'Open Cursor Market', web_app: { url: appUrl } }]],
-    resize_keyboard: true,
-    is_persistent: true,
-    one_time_keyboard: false,
-    input_field_placeholder: 'Open Cursor Market'
-  };
-}
-
 async function setupOpenButtons(chatId, user) {
   const appUrl = webAppUrlFor(user);
 
-  // Кнопка Menu возле поля ввода в чате с ботом.
+  // Только маленькая кнопка Menu слева/возле поля ввода в чате.
+  // Нижнюю большую keyboard-кнопку НЕ отправляем.
   const menu = await api('setChatMenuButton', {
     chat_id: chatId,
     menu_button: {
@@ -148,7 +144,6 @@ async function setupOpenButtons(chatId, user) {
   });
   if (!menu?.ok) console.warn('[Bot] setChatMenuButton failed:', menu);
 
-  // Команды бота.
   await api('setMyCommands', {
     commands: [
       { command: 'start', description: 'Start Cursor Market' },
@@ -176,7 +171,7 @@ async function sendStart(chatId, user) {
     if (!sent?.ok) console.warn('[Bot] sendPhoto with web_app failed:', sent);
   }
 
-  // 2. Если web_app отклонён — баннер с обычной url кнопкой.
+  // 2. Если web_app отклонён — баннер с обычной URL-кнопкой.
   if ((!sent || !sent.ok) && fs.existsSync(BANNER_FILE)) {
     sent = await apiMultipart('sendPhoto', {
       chat_id: String(chatId),
@@ -186,7 +181,7 @@ async function sendStart(chatId, user) {
     if (!sent?.ok) console.warn('[Bot] sendPhoto with url failed:', sent);
   }
 
-  // 3. Если есть BANNER_URL/file_id — fallback.
+  // 3. Fallback через BANNER_URL/file_id.
   if ((!sent || !sent.ok) && FALLBACK_BANNER_URL) {
     sent = await api('sendPhoto', {
       chat_id: chatId,
@@ -206,8 +201,7 @@ async function sendStart(chatId, user) {
     });
     if (!sent?.ok) console.warn('[Bot] sendMessage fallback failed:', sent);
   }
-
-
+}
 
 async function handleUpdate(update) {
   const msg = update.message;
