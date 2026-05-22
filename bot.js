@@ -207,14 +207,7 @@ async function sendStart(chatId, user) {
     if (!sent?.ok) console.warn('[Bot] sendMessage fallback failed:', sent);
   }
 
-  // 5. Постоянная клавиатура снизу в чате.
-  const kb = await api('sendMessage', {
-    chat_id: chatId,
-    text: '✅ Cursor Market is ready. Use the button below to open it anytime.',
-    reply_markup: persistentKeyboard(appUrl)
-  });
-  if (!kb?.ok) console.warn('[Bot] persistent keyboard failed:', kb);
-}
+
 
 async function handleUpdate(update) {
   const msg = update.message;
