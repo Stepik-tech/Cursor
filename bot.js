@@ -1,12 +1,15 @@
 /**
- * CursorGift Bot — только /start с баннером
+ * CursorGift Bot — /start, persistent Open button, local banner upload
  */
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
 
 const TOKEN = process.env.BOT_TOKEN || ''; // задаётся в Railway Variables
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://stepik-tech.github.io/market/';
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/CursorGift_bot';
-const BANNER_URL = 'https://i.imgur.com/HxHHYuf.png'; // твой баннер
+const BANNER_FILE = process.env.BANNER_FILE || path.join(__dirname, 'banner.jpg');
+const FALLBACK_BANNER_URL = process.env.BANNER_URL || ''; // можно задать file_id или стабильный URL, если нужен
 
 function webAppUrlFor(user) {
   try {
@@ -32,10 +35,146 @@ function api(method, data) {
     }, res => {
       let d = '';
       res.on('data', c => d += c);
-      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({}); } });
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ ok:false, raw:d }); } });
     });
-    req.on('error', () => resolve({}));
+    req.on('error', e => resolve({ ok:false, error:e.message }));
     req.write(body); req.end();
+  });
+}
+
+function apiMultipart(method, fields, fileField, filePath, filename='banner.jpg', contentType='image/jpeg') {
+  return new Promise((resolve) => {
+    if (!TOKEN) return resolve({ ok:false, error:'BOT_TOKEN is not set' });
+    if (!fs.existsSync(filePath)) return resolve({ ok:false, error:'file not found' });
+
+    const boundary = '----CursorGiftBoundary' + Date.now().toString(16);
+    const chunks = [];
+    const add = v => chunks.push(Buffer.isBuffer(v) ? v : Buffer.from(String(v)));
+
+    for (const [key, value] of Object.entries(fields || {})) {
+      add(`--${boundary}\r\n`);
+      add(`Content-Disposition: form-data; name="${key}"\r\n\r\n`);
+      add(typeof value === 'string' ? value : JSON.stringify(value));
+      add('\r\n');
+    }
+
+    add(`--${boundary}\r\n`);
+    add(`Content-Disposition: form-data; name="${fileField}"; filename="${filename}"\r\n`);
+    add(`Content-Type: ${contentType}\r\n\r\n`);
+    add(fs.readFileSync(filePath));
+    add(`\r\n--${boundary}--\r\n`);
+
+    const body = Buffer.concat(chunks);
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TOKEN}/${method}`,
+      method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': body.length }
+    }, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => { try { resolve(JSON.parse(d)); } catch(e) { resolve({ ok:false, raw:d }); } });
+    });
+    req.on('error', e => resolve({ ok:false, error:e.message }));
+    req.write(body); req.end();
+  });
+}
+
+function captionText() {
+  return `🎁 *CursorGift — рынок Telegram подарков*\n\n` +
+    `📊 Реальные цены · Portal Market\n` +
+    `📈 Графики от первой продажи\n` +
+    `📺 Pepe Upgrade / CRT Terminal\n` +
+    `💹 TON/USD в реальном времени\n\n` +
+    `👇 Нажми чтобы открыть!`;
+}
+
+function inlineOpenMarkup(appUrl) {
+  return {
+    inline_keyboard: [
+      [{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }],
+      [{ text: '📢 Наш канал', url: CHANNEL_URL }]
+    ]
+  };
+}
+
+function persistentKeyboard(appUrl) {
+  return {
+    keyboard: [[{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }]],
+    resize_keyboard: true,
+    is_persistent: true,
+    one_time_keyboard: false,
+    input_field_placeholder: 'Открыть CursorGift'
+  };
+}
+
+async function setupOpenButtons(chatId, user) {
+  const appUrl = webAppUrlFor(user);
+
+  // Кнопка Menu возле поля ввода — остаётся в чате после /start.
+  await api('setChatMenuButton', {
+    chat_id: chatId,
+    menu_button: {
+      type: 'web_app',
+      text: 'Открыть',
+      web_app: { url: appUrl }
+    }
+  });
+
+  // Команды, чтобы пользователь видел /start и /open.
+  await api('setMyCommands', {
+    commands: [
+      { command: 'start', description: 'Запустить CursorGift' },
+      { command: 'open', description: 'Открыть приложение' }
+    ]
+  });
+
+  return appUrl;
+}
+
+async function sendStart(chatId, user) {
+  const appUrl = await setupOpenButtons(chatId, user);
+  const replyMarkup = inlineOpenMarkup(appUrl);
+
+  // Локальный upload баннера: не зависит от Imgur и региональных блокировок.
+  let sent = null;
+  if (fs.existsSync(BANNER_FILE)) {
+    sent = await apiMultipart('sendPhoto', {
+      chat_id: String(chatId),
+      caption: captionText(),
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup
+    }, 'photo', BANNER_FILE, path.basename(BANNER_FILE), 'image/jpeg');
+  }
+
+  // Если локальный файл почему-то не отправился, пробуем env BANNER_URL/file_id.
+  if ((!sent || !sent.ok) && FALLBACK_BANNER_URL) {
+    sent = await api('sendPhoto', {
+      chat_id: chatId,
+      photo: FALLBACK_BANNER_URL,
+      caption: captionText(),
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup
+    });
+  }
+
+  // Последний fallback — обычное сообщение без картинки.
+  if (!sent || !sent.ok) {
+    await api('sendMessage', {
+      chat_id: chatId,
+      text: captionText(),
+      parse_mode: 'Markdown',
+      reply_markup: replyMarkup
+    });
+  }
+
+  // Отдельное сообщение с постоянной клавиатурой “Открыть”.
+  // Именно эта кнопка остаётся снизу в чате, чтобы не искать /start заново.
+  await api('sendMessage', {
+    chat_id: chatId,
+    text: '✅ Готово. Кнопка *Открыть CursorGift* закреплена в чате ниже и в меню бота.',
+    parse_mode: 'Markdown',
+    reply_markup: persistentKeyboard(appUrl)
   });
 }
 
@@ -45,32 +184,12 @@ async function handleUpdate(update) {
 
   const chatId = msg.chat.id;
   const text = (msg.text || '').split(' ')[0].replace('@CursorGift_bot', '');
-  const appUrl = webAppUrlFor(msg.from);
 
-  // Любая команда или сообщение → баннер
-  await api('sendPhoto', {
-    chat_id: chatId,
-    photo: BANNER_URL,
-    caption:
-      `🎁 *CursorGift — рынок Telegram подарков*\n\n` +
-      `📊 Реальные цены · Portal Market\n` +
-      `📈 Графики от первой продажи\n` +
-      `🎡 Колесо Апгрейда\n` +
-      `💹 TON/USD в реальном времени\n\n` +
-      `👇 Нажми чтобы открыть!`,
-    parse_mode: 'Markdown',
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }],
-        [
-          { text: '📢 Наш канал', url: CHANNEL_URL },
-        ]
-      ]
-    }
-  });
+  // На /start, /open и любое сообщение обновляем постоянную кнопку и показываем открытие.
+  await sendStart(chatId, msg.from);
 }
 
-module.exports = { handleUpdate };
+module.exports = { handleUpdate, setupOpenButtons, webAppUrlFor };
 
 if (require.main === module) {
   console.log('🤖 CursorGift Bot polling...');
