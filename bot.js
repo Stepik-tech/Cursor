@@ -81,32 +81,18 @@ function apiMultipart(method, fields, fileField, filePath, filename='banner.jpg'
 }
 
 function captionText() {
-  return `🎁 *CursorGift — рынок Telegram подарков*\n\n` +
-    `📊 Реальные цены · Portal Market\n` +
-    `📈 Графики от первой продажи\n` +
-    `📺 Pepe Upgrade / CRT Terminal\n` +
-    `💹 TON/USD в реальном времени\n\n` +
-    `👇 Нажми чтобы открыть!`;
+  return ` *Cursor Market — рынок Telegram подарков*\n\n` +
 }
 
 function inlineOpenMarkup(appUrl) {
   return {
     inline_keyboard: [
-      [{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }],
-      [{ text: '📢 Наш канал', url: CHANNEL_URL }]
+      [{ text: 'Open Cursor Market', web_app: { url: appUrl } }],
+      [{ text: 'Join the Community ', url: https://t.me/Cursor_Market }]
     ]
   };
 }
 
-function persistentKeyboard(appUrl) {
-  return {
-    keyboard: [[{ text: '🚀 Открыть CursorGift', web_app: { url: appUrl } }]],
-    resize_keyboard: true,
-    is_persistent: true,
-    one_time_keyboard: false,
-    input_field_placeholder: 'Открыть CursorGift'
-  };
-}
 
 async function setupOpenButtons(chatId, user) {
   const appUrl = webAppUrlFor(user);
@@ -168,15 +154,7 @@ async function sendStart(chatId, user) {
     });
   }
 
-  // Отдельное сообщение с постоянной клавиатурой “Открыть”.
-  // Именно эта кнопка остаётся снизу в чате, чтобы не искать /start заново.
-  await api('sendMessage', {
-    chat_id: chatId,
-    text: '✅ Готово. Кнопка *Открыть CursorGift* закреплена в чате ниже и в меню бота.',
-    parse_mode: 'Markdown',
-    reply_markup: persistentKeyboard(appUrl)
-  });
-}
+
 
 async function handleUpdate(update) {
   const msg = update.message;
