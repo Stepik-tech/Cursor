@@ -9,7 +9,7 @@ const path = require('path');
 const TOKEN = process.env.BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN || process.env.TOKEN || '';
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://stepik-tech.github.io/market/';
 const CHANNEL_URL = process.env.CHANNEL_URL || 'https://t.me/Cursor_Market';
-const BANNER_FILE = process.env.BANNER_FILE || path.join(__dirname, 'banner.jpg');
+const BANNER_FILE = process.env.BANNER_FILE || path.join(__dirname, 'banner.png');
 const FALLBACK_BANNER_URL = process.env.BANNER_URL || '';
 
 function webAppUrlFor(user) {
@@ -55,7 +55,7 @@ function api(method, data) {
   });
 }
 
-function apiMultipart(method, fields, fileField, filePath, filename = 'banner.jpg', contentType = 'image/jpeg') {
+function apiMultipart(method, fields, fileField, filePath, filename = 'banner.png', contentType = 'image/jpeg') {
   return new Promise((resolve) => {
     if (!TOKEN) return resolve({ ok: false, error: 'BOT_TOKEN is not set' });
     if (!fs.existsSync(filePath)) return resolve({ ok: false, error: 'file not found: ' + filePath });
