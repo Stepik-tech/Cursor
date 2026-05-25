@@ -1,44 +1,36 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const http = require('http');
+const WebSocket = require('ws');
+
 const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
 app.use(cors());
 app.use(express.json());
 
-// Хранилище для отслеживания спроса
 let collectionsCache = null;
-let priceHistoryCache = {}; 
-let lastListedMap = {}; // Память листингов для детектора продаж
-let lastFetch = 0;
-const CACHE_TTL = 20000; 
+let lastListedMap = {}; 
+let tonUsd = 2.0;
 
-// ── TON/USD rate ──────────────────────────────────────────────────
-let tonUsd = 5.5;
-async function fetchTonRate() {
-    try {
-        const r = await fetch('https://tonapi.io/v2/rates?tokens=ton&currencies=usd', { timeout: 5000 });
-        const j = await r.json();
-        const rate = j?.rates?.TON?.prices?.USD;
-        if (rate > 0) tonUsd = parseFloat(parseFloat(rate).toFixed(4));
-    } catch(e) {}
-}
-
-// ── ДЕТЕКТОР ПРОДАЖ И ГЕНЕРАТОР ЦЕНЫ ──────────────────────────────
+// ЛОГИКА ДЕТЕКТОРА ПРОДАЖ
 function applyDemandLogic(collections) {
+    console.log(`[Analytics] Scanning ${collections.length} collections for sales...`);
+    
     return collections.map(c => {
         const slug = c.slug;
         const currentListed = c.listed || 0;
         const prevListed = lastListedMap[slug] || currentListed;
 
-        // Если количество листингов уменьшилось — была реальная продажа!
+        // Если подарков стало меньше — это продажа!
         if (currentListed < prevListed && prevListed > 0) {
-            const soldCount = prevListed - currentListed;
-            // Добавляем бонус к цене (0.5% за каждый проданный подарок)
-            const demandBonus = 1 + (soldCount * 0.005);
-            c.floor = parseFloat((c.floor * demandBonus).toFixed(2));
-            c.hotSale = true; // Флаг "Горячая продажа"
-            console.log(`[!] Продажа на Fragment: ${slug} (${soldCount} шт). Новая цена: ${c.floor}`);
+            const sold = prevListed - currentListed;
+            const bonus = 1 + (sold * 0.007); // +0.7% за продажу
+            c.floor = parseFloat((c.floor * bonus).toFixed(2));
+            c.hotSale = true; 
+            console.log(`🔥 ВНИМАНИЕ! Продажа ${slug}: ${sold} шт. Цена выросла до ${c.floor}`);
         } else {
             c.hotSale = false;
         }
@@ -48,77 +40,49 @@ function applyDemandLogic(collections) {
     });
 }
 
-// ── Portal Market — основной источник ────────────────────────────
-async function fetchPortal() {
+async function updateAll() {
     try {
-        const r = await fetch('https://portal-market.com/api/collections?limit=300', {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (compatible; GiftMarketBot/1.0)',
-                'Accept': 'application/json',
-                'Referer': 'https://portal-market.com/'
-            },
-            timeout: 10000
-        });
+        const r = await fetch('https://portal-market.com/api/collections?limit=300');
         const j = await r.json();
-        const cols = j.collections || [];
-        const changes = j.floor_changes || {};
-
-        let data = cols.map(c => ({
-            id: c.id,
+        
+        // Берем данные
+        let data = (j.collections || []).map(c => ({
             name: c.name,
             slug: c.short_name,
-            photo: `https://fragment.com/file/gifts/${c.short_name}/thumb.webp`,
-            portalPhoto: c.photo_url,
             floor: parseFloat(c.floor_price) || 0,
-            change24h: parseFloat((parseFloat(changes[c.id] || 0) * 100).toFixed(2)),
-            vol24h: parseFloat(c.day_volume) || 0,
             listed: c.listed_count || 0,
-            supply: c.supply || 0,
-            marketCap: parseFloat(c.market_cap) || 0,
-            sales24h: c.sales_24h_count || 0,
-            isNew: c.is_new || false,
-            source: 'portal'
+            vol24h: parseFloat(c.day_volume) || 0,
+            photo: `https://fragment.com/file/gifts/${c.short_name}/thumb.webp`
         }));
 
-        // Применяем логику спроса перед кэшированием
-        return applyDemandLogic(data);
-
-    } catch(e) {
-        console.error('[Portal] Error:', e.message);
-        return null;
+        // Запускаем наш детектор
+        collectionsCache = applyDemandLogic(data);
+        
+        // Отправляем всем в Mini App
+        const payload = JSON.stringify({ type: 'prices', collections: collectionsCache, ton_usd: tonUsd });
+        wss.clients.forEach(s => { if(s.readyState === WebSocket.OPEN) s.send(payload); });
+        
+        console.log(`[Server] Data sent to ${wss.clients.size} users. TON: $${tonUsd}`);
+    } catch(e) { 
+        console.log('!!! Ошибка обновления:', e.message); 
     }
 }
 
-async function updateAll() {
-    const now = Date.now();
-    if (now - lastFetch < CACHE_TTL && collectionsCache) return;
-    lastFetch = now;
-
-    const portalData = await fetchPortal();
-    await fetchTonRate();
-
-    if (portalData) {
-        collectionsCache = portalData;
-        collectionsCache.forEach(c => {
-            if (!priceHistoryCache[c.slug]) priceHistoryCache[c.slug] = [];
-            priceHistoryCache[c.slug].push({ time: now, price: c.floor });
-            if (priceHistoryCache[c.slug].length > 1000) priceHistoryCache[c.slug].shift();
-        });
-    }
+// TON Rate
+async function updateTon() {
+    try {
+        const r = await fetch('https://tonapi.io/v2/rates?tokens=ton&currencies=usd');
+        const j = await r.json();
+        tonUsd = j?.rates?.TON?.prices?.USD || tonUsd;
+    } catch(e) {}
 }
 
-// Routes
-app.get('/api/prices', async (req, res) => {
-    await updateAll();
-    res.json({ collections: collectionsCache || [], ton_usd: tonUsd });
-});
+setInterval(updateAll, 20000);
+setInterval(updateTon, 60000);
+updateAll();
 
-app.get('/api/history/:slug', (req, res) => {
-    const { slug } = req.params;
-    res.json({ slug, history: priceHistoryCache[slug] || [] });
-});
+app.get('/api/prices', (req, res) => res.json({ collections: collectionsCache || [], ton_usd: tonUsd }));
+app.get('/', (req, res) => res.send('Cursor Market Server is Active'));
 
-app.get('/', (req, res) => res.send('Cursor Market Backend is Live'));
-
-const PORT = process.env.PORT || 3333;
-app.listen(PORT, () => console.log(`🚀 Server running on :${PORT}`));
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, () => console.log(`\n🚀 CURSOR SERVER START ON PORT ${PORT}\n`));
